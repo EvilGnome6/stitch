@@ -1,0 +1,11 @@
+.DS_Store
+.venv/
+**/__pycache__/
+*.pyc
+app/build/
+app/Stitch/Resources/engine/
+engine/.venv/
+engine/stitch-engine
+engine/dist/
+*.app/
+_compare/
