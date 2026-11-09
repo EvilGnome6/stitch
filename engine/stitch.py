@@ -37,6 +37,11 @@ BLEND_STRENGTH = 5
 BLEND_TYPE = "no"  # no | freq | feather | multiband — "no"=hard paste after block gain
 LF_SIGMA = 12.0  # illumination only; larger values smear mid-freq into a soft stripe
 EXPOS_BLOCK = 64  # large-ish blocks for smooth scanner drift
+# Work-megapix BA often leaves a few full-res px of vertical error (sparse
+# matches + halftone ambiguity). Probe-compose and nudge cam1.ty to fix.
+REFINE_PROBE_SCALE = 0.5
+REFINE_MAX_PASSES = 2
+REFINE_MIN_ABS_PX = 0.4  # full-res px; ignore tiny residuals
 
 
 class StitchError(Exception):
@@ -139,6 +144,226 @@ def trim_opaque(bgr: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarr
     x0, x1 = int(xs.min()), int(xs.max()) + 1
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     return bgr[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+
+
+def _clone_cameras(cameras: list) -> list:
+    out = []
+    for cam in cameras:
+        c = cv.detail.CameraParams()
+        c.focal = float(cam.focal)
+        c.aspect = float(cam.aspect)
+        c.ppx = float(cam.ppx)
+        c.ppy = float(cam.ppy)
+        c.R = np.asarray(cam.R, dtype=np.float32).reshape(3, 3).copy()
+        out.append(c)
+    return out
+
+
+def _find_hard_seam_x(gray: np.ndarray) -> int:
+    """Column with the strongest mean |horizontal gradient| in the center half."""
+    h, w = gray.shape[:2]
+    score = np.abs(np.diff(gray.astype(np.float32), axis=1)).mean(axis=0)
+    score[: w // 4] = 0
+    score[3 * w // 4 :] = 0
+    return int(np.argmax(score))
+
+
+def measure_vertical_seam_offset(
+    bgr: np.ndarray,
+    seam_x: int | None = None,
+) -> float | None:
+    """How many pixels lower the right seam side sits vs the left.
+
+    Prefers a strong horizontal light→dark boundary (page edge / printed bar),
+    which is robust to halftone phase ambiguity. Falls back to Sobel-Y phase
+    correlation along the seam. Returns None when the signal is unreliable.
+
+    Pass ``seam_x`` from the hard vertical cut when known — max-gradient
+    column search can lock onto tone edges that are *not* the paste seam.
+    """
+    if bgr is None or bgr.size == 0:
+        return None
+    gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    if h < 80 or w < 200:
+        return None
+    if seam_x is None:
+        # Prefer the geometric mid (booklet cut) when it has a real boundary;
+        # fall back to max-gradient. Evaluating both avoids false zeros.
+        candidates = [w // 2, _find_hard_seam_x(gray)]
+    else:
+        candidates = [int(seam_x)]
+
+    y0 = int(h * 0.55)
+
+    def _edge_y(x0: int, x1: int) -> tuple[float, float] | None:
+        col = gray[:, x0:x1].astype(np.float32).mean(axis=1)
+        d = np.diff(col)
+        region = d[y0:]
+        if region.size < 8:
+            return None
+        i = int(np.argmin(region))
+        ye = y0 + i
+        drop = float(col[max(0, ye - 4)] - col[min(h - 1, ye + 4)])
+        if drop < 40.0:
+            return None
+        y_a = max(0, ye - 40)
+        y_b = min(h, ye + 40)
+        strip = gray[y_a:y_b, x0:x1]
+        up = cv.resize(
+            strip,
+            (strip.shape[1] * 4, strip.shape[0] * 4),
+            interpolation=cv.INTER_CUBIC,
+        )
+        row = up.astype(np.float32).mean(axis=1)
+        dd = np.diff(row)
+        j = int(np.argmin(dd))
+        if 0 < j < len(dd) - 1:
+            a, b, c = float(dd[j - 1]), float(dd[j]), float(dd[j + 1])
+            den = a - 2 * b + c
+            delta = 0.0 if abs(den) < 1e-6 else 0.5 * (a - c) / den
+        else:
+            delta = 0.0
+        return (y_a + (j + delta) / 4.0), drop
+
+    def _offset_at(sx: int) -> float | None:
+        sx = int(np.clip(sx, 80, w - 80))
+        left = _edge_y(sx - 70, sx - 15)
+        right = _edge_y(sx + 15, sx + 70)
+        if left is not None and right is not None:
+            return float(right[0] - left[0])
+        edges = cv.Sobel(gray, cv.CV_32F, 0, 1, ksize=3)
+        half = min(100, sx - 5, w - sx - 5)
+        if half < 40:
+            return None
+        y_a, y_b = int(h * 0.45), int(h * 0.95)
+        a = edges[y_a:y_b, sx - half : sx - 8].astype(np.float64)
+        b = edges[y_a:y_b, sx + 8 : sx + half].astype(np.float64)
+        mw = min(a.shape[1], b.shape[1])
+        if a.shape[0] < 32 or mw < 16:
+            return None
+        a = a[:, :mw]
+        b = b[:, :mw]
+        win = np.hanning(a.shape[0])[:, None] * np.hanning(mw)[None, :]
+        shift, resp = cv.phaseCorrelate(a * win, b * win)
+        if resp < 0.25 or abs(shift[1]) > h * 0.05:
+            return None
+        return float(shift[1])
+
+    best: float | None = None
+    for sx in candidates:
+        off = _offset_at(sx)
+        if off is None:
+            continue
+        if best is None or abs(off) > abs(best):
+            best = off
+    return best
+
+
+def refine_vertical_translation(
+    cameras: list,
+    images: list[np.ndarray],
+    *,
+    work_scale: float,
+    probe_scale: float = REFINE_PROBE_SCALE,
+    max_passes: int = REFINE_MAX_PASSES,
+) -> list:
+    """Nudge camera[1] ty so a probe hard-seam compose has no vertical step.
+
+    OpenCV's work-megapix affine BA is under-constrained on soft/halftone
+    overlaps and often leaves a few full-res pixels of vertical error that
+    show up as a step at the booklet seam (especially at the bottom).
+    """
+    if len(cameras) != 2 or len(images) != 2:
+        return cameras
+    if work_scale <= 0 or probe_scale <= 0:
+        return cameras
+
+    cams = _clone_cameras(cameras)
+    for _ in range(max_passes):
+        probe_imgs = [
+            cv.resize(
+                img,
+                dsize=None,
+                fx=probe_scale,
+                fy=probe_scale,
+                interpolation=cv.INTER_AREA,
+            )
+            for img in images
+        ]
+        aspect = probe_scale / work_scale
+        focals = [float(c.focal) for c in cams]
+        warped_scale = float(np.median(focals)) * aspect
+        probe_cams = _clone_cameras(cams)
+        for c in probe_cams:
+            c.focal *= aspect
+            c.ppx *= aspect
+            c.ppy *= aspect
+        warper = cv.PyRotationWarper("affine", warped_scale)
+        corners: list[tuple[int, int]] = []
+        warped: list[np.ndarray] = []
+        masks: list[np.ndarray] = []
+        for i, img in enumerate(probe_imgs):
+            K = probe_cams[i].K().astype(np.float32)
+            corner, image_wp = warper.warp(
+                img, K, probe_cams[i].R, cv.INTER_LINEAR, cv.BORDER_REFLECT
+            )
+            mask = 255 * np.ones(img.shape[:2], np.uint8)
+            _, mask_wp = warper.warp(
+                mask, K, probe_cams[i].R, cv.INTER_NEAREST, cv.BORDER_CONSTANT
+            )
+            corners.append(corner)
+            warped.append(image_wp)
+            masks.append(mask_wp)
+        # Same mid-overlap cut that compose will use — measure there, not at
+        # whatever column happens to have the strongest tone gradient.
+        sizes = [(im.shape[1], im.shape[0]) for im in warped]
+        x0, y0, W, H = cv.detail.resultRoi(corners=corners, sizes=sizes)
+        canvases = []
+        for mask, corner in zip(masks, corners):
+            m = (np.asarray(mask) > 0).astype(np.uint8)
+            cx, cy = int(corner[0]), int(corner[1])
+            mh, mw = m.shape[:2]
+            canvas = np.zeros((H, W), dtype=np.uint8)
+            ix0, iy0 = cx - x0, cy - y0
+            sx0, sy0 = max(0, -ix0), max(0, -iy0)
+            dx0, dy0 = max(0, ix0), max(0, iy0)
+            sx1, sy1 = min(mw, W - ix0), min(mh, H - iy0)
+            if sx1 > sx0 and sy1 > sy0:
+                canvas[dy0 : dy0 + (sy1 - sy0), dx0 : dx0 + (sx1 - sx0)] = m[
+                    sy0:sy1, sx0:sx1
+                ]
+            canvases.append(canvas)
+        overlap = (canvases[0] > 0) & (canvases[1] > 0)
+        if not np.any(overlap):
+            break
+        xs = np.where(overlap.any(axis=0))[0]
+        seam_x_panorama = int((int(xs.min()) + int(xs.max())) // 2)
+
+        masks = straight_vertical_seam_masks(masks, corners)
+        probe, probe_mask = compose_hard_paste(warped, masks, corners)
+        # Map panorama seam into the trimmed probe coordinates.
+        probe_trim, mask_trim = trim_opaque(probe, probe_mask)
+        ys, xxs = np.where(probe_mask > 0)
+        if len(xxs) == 0:
+            break
+        trim_x0 = int(xxs.min())
+        seam_x = seam_x_panorama - trim_x0
+        offset_probe = measure_vertical_seam_offset(probe_trim, seam_x=seam_x)
+        if offset_probe is None:
+            break
+        dy_full = float(offset_probe) / probe_scale
+        if abs(dy_full) < REFINE_MIN_ABS_PX:
+            break
+        # Guard against runaway corrections on ambiguous content.
+        if abs(dy_full) > 80.0:
+            break
+        R1 = np.asarray(cams[1].R, dtype=np.float32).reshape(3, 3).copy()
+        # R translations are in work-scale pixels; positive dy_full means the
+        # right panel sits too low in the probe, so push cam1.ty up.
+        R1[1, 2] += np.float32(dy_full * work_scale)
+        cams[1].R = R1
+    return cams
 
 
 def straight_vertical_seam_masks(
@@ -496,6 +721,12 @@ def stitch_planar(
     ok, cameras = adjuster.apply(features, pairwise, cameras)
     if not ok:
         raise StitchError("Affine bundle adjustment failed")
+
+    # Work-res BA often leaves a few full-res px of vertical error on soft
+    # overlaps; probe-compose and nudge cam1 translation before final warp.
+    cameras = refine_vertical_translation(
+        cameras, full_imgs, work_scale=work_scale
+    )
 
     focals = sorted(float(cam.focal) for cam in cameras)
     if len(focals) % 2 == 1:
