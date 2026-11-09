@@ -22,8 +22,16 @@ from PIL import Image
 WORK_MEGAPIX = 0.6
 SEAM_MEGAPIX = 0.1
 COMPOSE_MEGAPIX = -1.0  # full resolution
-CONF_THRESH = 1.0
-MATCH_CONF = 0.65
+# OpenCV BestOf2NearestMatcher: higher match_conf = stricter Lowe ratio
+# (keep if d1 < (1 - match_conf) * d2). 0.65 rejected low-texture booklet
+# overlaps; 0.5 still filters weak pairs. conf_thresh gates pairwise edges
+# in leaveBiggestComponent / bundle adjust — soft overlaps often land ~0.7.
+CONF_THRESH = 0.5
+MATCH_CONF = 0.5
+# If the first pass finds no connected overlap, retry these (more permissive).
+MATCH_FALLBACKS = (
+    (0.4, 0.45),
+)
 # Frequency-split: wide LF feather hides seams/tone jumps; hard HF keeps screen.
 BLEND_STRENGTH = 5
 BLEND_TYPE = "no"  # no | freq | feather | multiband — "no"=hard paste after block gain
@@ -360,7 +368,7 @@ def stitch_planar(
     full_imgs: list[np.ndarray] = []
     full_sizes: list[tuple[int, int]] = []
     metas: list[dict] = []
-    features = []
+    work_images: list[np.ndarray] = []
     seam_images = []
 
     work_scale = 1.0
@@ -387,15 +395,15 @@ def stitch_planar(
                 )
             is_work_scale_set = True
 
-        work_img = cv.resize(
-            bgr,
-            dsize=None,
-            fx=work_scale,
-            fy=work_scale,
-            interpolation=cv.INTER_LINEAR_EXACT,
+        work_images.append(
+            cv.resize(
+                bgr,
+                dsize=None,
+                fx=work_scale,
+                fy=work_scale,
+                interpolation=cv.INTER_LINEAR_EXACT,
+            )
         )
-        feat = cv.detail.computeImageFeatures2(finder, work_img)
-        features.append(feat)
 
         if not is_seam_scale_set:
             if seam_megapix > 0:
@@ -418,14 +426,36 @@ def stitch_planar(
             )
         )
 
-    matcher = cv.detail_AffineBestOf2NearestMatcher(False, False, match_conf)
-    pairwise = matcher.apply2(features)
-    matcher.collectGarbage()
+    # leaveBiggestComponent mutates features, so each attempt recomputes them.
+    # Higher match_conf is stricter (Lowe ratio); lower conf_thresh is more
+    # permissive for connected-component / bundle-adjust edge filtering.
+    attempts: list[tuple[float, float]] = [(match_conf, conf_thresh)]
+    for mc, ct in MATCH_FALLBACKS:
+        if (mc, ct) in attempts:
+            continue
+        # Only add steps that are at least as permissive as the caller's request.
+        if mc <= match_conf and ct <= conf_thresh:
+            attempts.append((mc, ct))
 
-    # Mutates features/pairwise in place to the largest connected component;
-    # returned indices refer to the original image list.
-    indices = cv.detail.leaveBiggestComponent(features, pairwise, conf_thresh)
-    idx_list = [int(i) for i in indices]
+    features = None
+    pairwise = None
+    idx_list: list[int] = []
+    for mc, ct in attempts:
+        features = [
+            cv.detail.computeImageFeatures2(finder, work_img)
+            for work_img in work_images
+        ]
+        matcher = cv.detail_AffineBestOf2NearestMatcher(False, False, mc)
+        pairwise = matcher.apply2(features)
+        matcher.collectGarbage()
+        # Mutates features/pairwise in place to the largest connected component;
+        # returned indices refer to the original image list.
+        indices = cv.detail.leaveBiggestComponent(features, pairwise, ct)
+        idx_list = [int(i) for i in indices]
+        if len(idx_list) >= 2:
+            conf_thresh = ct
+            break
+
     if len(idx_list) < 2:
         raise StitchError(
             "Could not find enough overlapping matches between images "
