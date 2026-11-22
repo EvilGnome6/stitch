@@ -21,6 +21,10 @@ Requires Homebrew Python 3 (`brew install python`) and Apple Command Line Tools 
 open app/build/Stitch.app
 ```
 
+`build-app.sh` always re-runs `sync-engine.sh` so the app does not keep a stale
+`Resources/engine` (an old copy with `MATCH_CONF=0.65` fails soft booklet
+overlaps with “Could not find enough overlapping matches”).
+
 Engine only:
 
 ```bash

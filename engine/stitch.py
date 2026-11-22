@@ -29,9 +29,14 @@ COMPOSE_MEGAPIX = -1.0  # full resolution
 CONF_THRESH = 0.5
 MATCH_CONF = 0.5
 # If the first pass finds no connected overlap, retry these (more permissive).
+# Soft/halftone booklet overlaps often land ~0.7 pairwise conf — below the
+# old OpenCV-style thresh of 1.0 — so keep a short ladder down to 0.3.
 MATCH_FALLBACKS = (
     (0.4, 0.45),
+    (0.3, 0.3),
 )
+# Bumped when match/seam defaults change so a stale app Resources engine is obvious.
+ENGINE_REVISION = "2026-11-22-seam-match"
 # Frequency-split: wide LF feather hides seams/tone jumps; hard HF keeps screen.
 BLEND_STRENGTH = 5
 # "seam"=narrow mid-overlap feather (ICE-like); "no"=hard paste; also freq/feather/multiband.
@@ -1027,6 +1032,7 @@ def stitch_planar(
     features = None
     pairwise = None
     idx_list: list[int] = []
+    used_match = (match_conf, conf_thresh)
     for mc, ct in attempts:
         features = [
             cv.detail.computeImageFeatures2(finder, work_img)
@@ -1041,12 +1047,14 @@ def stitch_planar(
         idx_list = [int(i) for i in indices]
         if len(idx_list) >= 2:
             conf_thresh = ct
+            used_match = (mc, ct)
             break
 
     if len(idx_list) < 2:
         raise StitchError(
             "Could not find enough overlapping matches between images "
-            "(need clear overlap, like ICE planar). Check order and overlap."
+            "(need clear overlap, like ICE planar). Check order and overlap. "
+            f"[engine {ENGINE_REVISION}; tried match_conf/conf_thresh={attempts}]"
         )
 
     seam_images = [seam_images[i] for i in idx_list]
@@ -1292,6 +1300,9 @@ def stitch_planar(
     meta["paths_used"] = [str(p) for p in paths_used]
     meta["dropped"] = dropped_note
     meta["count"] = num_images
+    meta["engine_revision"] = ENGINE_REVISION
+    meta["match_conf_used"] = float(used_match[0])
+    meta["conf_thresh_used"] = float(used_match[1])
     return result_u8, mask_u8, meta
 
 
@@ -1382,7 +1393,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     except StitchError as exc:
         _emit(
-            {"ok": False, "status": "error", "message": str(exc)},
+            {
+                "ok": False,
+                "status": "error",
+                "message": str(exc),
+                "engineRevision": ENGINE_REVISION,
+            },
             as_json=as_json,
         )
         return 2
@@ -1392,6 +1408,7 @@ def main(argv: list[str] | None = None) -> int:
                 "ok": False,
                 "status": "error",
                 "message": f"{type(exc).__name__}: {exc}",
+                "engineRevision": ENGINE_REVISION,
             },
             as_json=as_json,
         )
@@ -1413,6 +1430,9 @@ def main(argv: list[str] | None = None) -> int:
             "height": h,
             "count": meta["count"],
             "tiff": all(_is_tiff(p) for p in paths),
+            "engineRevision": ENGINE_REVISION,
+            "matchConf": meta.get("match_conf_used"),
+            "confThresh": meta.get("conf_thresh_used"),
         },
         as_json=as_json,
     )
