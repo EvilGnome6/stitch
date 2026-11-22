@@ -1,6 +1,6 @@
 # Stitch
 
-Mac-native drop target for planar-stitching overlapping flatbed TIFF scans (CD booklets / multipanel digipaks). ICE-style scan motion: affine-partial alignment, block gain matching, multiband blend. No panorama skew.
+Mac-native drop target for planar-stitching overlapping flatbed TIFF scans (CD booklets / multipanel digipaks). Overlap-strip translation registration, light gain balance, narrow mid-overlap feather. No rotation, no perspective, no panorama skew.
 
 Same layout as [descreen](../descreen): Python **engine** + AppKit **app**.
 
@@ -22,8 +22,7 @@ open app/build/Stitch.app
 ```
 
 `build-app.sh` always re-runs `sync-engine.sh` so the app does not keep a stale
-`Resources/engine` (an old copy with `MATCH_CONF=0.65` fails soft booklet
-overlaps with “Could not find enough overlapping matches”).
+`Resources/engine`.
 
 Engine only:
 
@@ -35,7 +34,7 @@ cd engine && ./setup.sh
 
 Inputs are sorted by filename unless you pass `--keep-order`. Output defaults to `<first>-stitched.tif`.
 
-Planar only (translation + small rotation + uniform scale). No straighten / crop / autocomplete UI.
+Default pipeline: predicted overlap strips → phase correlation + ECC translation → optional 1D seam polish → gain + soft feather. Pass `--legacy-opencv-stitcher` only for A/B against the old `cv.detail` path. No straighten / crop / autocomplete UI.
 
 ## License
 

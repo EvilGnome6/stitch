@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Planar TIFF stitcher for flatbed CD booklet / digipak scans.
 
-Uses OpenCV's scan (affine) stitching path — not photo-panorama
-homography — so panels stay square instead of skewing. Feature match
-on 8-bit proxies; compose at full resolution with per-image gain
-and a narrow feather blend (multiband softens halftone skies).
+Default path is a constrained overlap-strip planar engine: translation
+registration on the predicted overlap (phase correlation + ECC), optional
+1D seam polish, light overlap gain, and a narrow mid-overlap feather.
+No rotation or perspective — flatbed panels stay square.
+
+Legacy OpenCV ``cv.detail`` affine stitcher remains behind
+``--legacy-opencv-stitcher`` for A/B.
 """
 
 from __future__ import annotations
@@ -22,21 +25,24 @@ from PIL import Image
 WORK_MEGAPIX = 0.6
 SEAM_MEGAPIX = 0.1
 COMPOSE_MEGAPIX = -1.0  # full resolution
-# OpenCV BestOf2NearestMatcher: higher match_conf = stricter Lowe ratio
-# (keep if d1 < (1 - match_conf) * d2). 0.65 rejected low-texture booklet
-# overlaps; 0.5 still filters weak pairs. conf_thresh gates pairwise edges
-# in leaveBiggestComponent / bundle adjust — soft overlaps often land ~0.7.
+# Predicted horizontal overlap as a fraction of each panel width.
+OVERLAP_FRAC = 0.30
+OVERLAP_FRAC_MIN = 0.15
+OVERLAP_FRAC_MAX = 0.40
+# Coarse strip registration downscale target (long edge).
+STRIP_COARSE_LONG_EDGE = 900
+STRIP_PHASE_MIN_RESP = 0.08
+STRIP_ECC_ITERATIONS = 80
+STRIP_ECC_EPS = 1e-5
+# OpenCV BestOf2NearestMatcher (legacy path only).
 CONF_THRESH = 0.5
 MATCH_CONF = 0.5
-# If the first pass finds no connected overlap, retry these (more permissive).
-# Soft/halftone booklet overlaps often land ~0.7 pairwise conf — below the
-# old OpenCV-style thresh of 1.0 — so keep a short ladder down to 0.3.
 MATCH_FALLBACKS = (
     (0.4, 0.45),
     (0.3, 0.3),
 )
 # Bumped when match/seam defaults change so a stale app Resources engine is obvious.
-ENGINE_REVISION = "2026-11-22-seam-match"
+ENGINE_REVISION = "2026-11-22-planar-strip"
 # Frequency-split: wide LF feather hides seams/tone jumps; hard HF keeps screen.
 BLEND_STRENGTH = 5
 # "seam"=narrow mid-overlap feather (ICE-like); "no"=hard paste; also freq/feather/multiband.
@@ -44,19 +50,18 @@ BLEND_TYPE = "seam"
 SEAM_FEATHER_PX = 28  # ICE planar joins are soft (~seam sharpness), not hard cuts
 LF_SIGMA = 12.0  # illumination only; larger values smear mid-freq into a soft stripe
 EXPOS_BLOCK = 64  # large-ish blocks for smooth scanner drift
-# Work-megapix BA leaves residual tx/ty/rotation on soft/halftone overlaps.
-# Probe the warped overlap near the future seam and nudge cam1.R to fix.
+# Probe the warped overlap near the future seam and nudge translation.
 REFINE_PROBE_SCALE = 0.5
 REFINE_MAX_PASSES = 3
 REFINE_MIN_ABS_PX = 0.35  # full-res px; ignore tiny residuals
 REFINE_MAX_ABS_PX = 40.0  # guard against runaway corrections
-REFINE_MIN_ROT_DEG = 0.004
-REFINE_MAX_ROT_DEG = 0.15
+REFINE_MIN_ROT_DEG = 0.004  # legacy opencv path only
+REFINE_MAX_ROT_DEG = 0.15  # legacy opencv path only
 REFINE_SEAM_BAND = 70  # probe-px half-width around mid-overlap seam
 REFINE_MIN_RESP = 0.15  # phaseCorrelate response floor per band
-# After global affine, residual dy(y) along the seam is still ±1–3px on
-# soft/halftone booklets. A 1D remap of the right panel, locked to the
-# ~6px screen via DoG/high-pass phase correlation, removes most of it.
+# After global translation, residual dy(y) along the seam is still ±1–3px on
+# soft/halftone booklets. A 1D remap of the right panel removes most of it
+# without introducing panel rotation.
 PIECEWISE_MAX_PASSES = 3
 PIECEWISE_STRIP = 90
 PIECEWISE_STEP = 30
@@ -941,6 +946,458 @@ def compose_frequency_split(
     return result, out_mask
 
 
+def _overlap_strips(
+    left: np.ndarray,
+    right: np.ndarray,
+    frac: float = OVERLAP_FRAC,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Right strip of left panel + left strip of right panel (same width)."""
+    h0, w0 = left.shape[:2]
+    h1, w1 = right.shape[:2]
+    frac = float(np.clip(frac, OVERLAP_FRAC_MIN, OVERLAP_FRAC_MAX))
+    sw = int(round(min(w0, w1) * frac))
+    sw = max(sw, 64)
+    sw = min(sw, w0 - 8, w1 - 8)
+    h = min(h0, h1)
+    # Top-align; flatbed booklet panels are usually same height.
+    left_strip = left[:h, w0 - sw : w0]
+    right_strip = right[:h, :sw]
+    return left_strip, right_strip, sw, w0
+
+
+def _gray32(bgr: np.ndarray) -> np.ndarray:
+    if bgr.ndim == 2:
+        g = bgr.astype(np.float32)
+    else:
+        g = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY).astype(np.float32)
+    return g
+
+
+def _phase_shift(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    blur_sigma: float = 1.5,
+) -> tuple[float, float, float]:
+    """phaseCorrelate shift that moves ``b`` onto ``a``; returns (dx, dy, resp)."""
+    ga = _gray32(a)
+    gb = _gray32(b)
+    if blur_sigma > 0:
+        ga = cv.GaussianBlur(ga, (0, 0), blur_sigma)
+        gb = cv.GaussianBlur(gb, (0, 0), blur_sigma)
+    win = np.hanning(ga.shape[0])[:, None] * np.hanning(ga.shape[1])[None, :]
+    (dx, dy), resp = cv.phaseCorrelate(ga * win, gb * win)
+    return float(dx), float(dy), float(resp)
+
+
+def _ecc_translation(
+    left_strip: np.ndarray,
+    right_strip: np.ndarray,
+    dx: float,
+    dy: float,
+) -> tuple[float, float, float]:
+    """Refine strip translation with ECC (MOTION_TRANSLATION only — no rotation)."""
+    a = _gray32(left_strip)
+    b = _gray32(right_strip)
+    # Mild blur stabilizes ECC on screened print.
+    a = cv.GaussianBlur(a, (0, 0), 1.0)
+    b = cv.GaussianBlur(b, (0, 0), 1.0)
+    a8 = np.clip(a, 0, 255).astype(np.uint8)
+    b8 = np.clip(b, 0, 255).astype(np.uint8)
+    warp = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+    criteria = (
+        cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT,
+        STRIP_ECC_ITERATIONS,
+        STRIP_ECC_EPS,
+    )
+    try:
+        cc, warp = cv.findTransformECC(
+            a8,
+            b8,
+            warp,
+            cv.MOTION_TRANSLATION,
+            criteria,
+            None,
+            1,
+        )
+    except cv.error:
+        return dx, dy, 0.0
+    return float(warp[0, 2]), float(warp[1, 2]), float(cc)
+
+
+def _strip_feature_translation(
+    left_strip: np.ndarray,
+    right_strip: np.ndarray,
+) -> tuple[float, float, float] | None:
+    """SIFT fallback inside the overlap strips → median (dx, dy), score."""
+    g0 = _gray32(left_strip).astype(np.uint8)
+    g1 = _gray32(right_strip).astype(np.uint8)
+    sift = cv.SIFT_create(nfeatures=2000)
+    k0, d0 = sift.detectAndCompute(g0, None)
+    k1, d1 = sift.detectAndCompute(g1, None)
+    if d0 is None or d1 is None or len(k0) < 8 or len(k1) < 8:
+        return None
+    matcher = cv.BFMatcher(cv.NORM_L2)
+    raw = matcher.knnMatch(d0, d1, k=2)
+    good: list[cv.DMatch] = []
+    for pair in raw:
+        if len(pair) != 2:
+            continue
+        m, n = pair
+        if m.distance < 0.8 * n.distance:
+            good.append(m)
+    if len(good) < 8:
+        return None
+    # Strips are nominally co-located; translation is median keypoint delta.
+    dxs = []
+    dys = []
+    for m in good:
+        p0 = k0[m.queryIdx].pt
+        p1 = k1[m.trainIdx].pt
+        dxs.append(p0[0] - p1[0])
+        dys.append(p0[1] - p1[1])
+    dx = float(np.median(dxs))
+    dy = float(np.median(dys))
+    # Inlier fraction within 3 px of median as a crude score.
+    keep = (np.abs(np.asarray(dxs) - dx) < 3.0) & (
+        np.abs(np.asarray(dys) - dy) < 3.0
+    )
+    score = float(keep.mean())
+    if score < 0.3:
+        return None
+    return dx, dy, score
+
+
+def _strip_shift_at_scale(
+    left_strip: np.ndarray,
+    right_strip: np.ndarray,
+    *,
+    scale: float,
+    blur_sigma: float = 1.5,
+) -> tuple[float, float, float]:
+    """Phase-correlate strips, optionally downscaled; returns full-res (dx, dy, resp)."""
+    if scale < 1.0:
+        ls = cv.resize(
+            left_strip,
+            dsize=None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv.INTER_AREA,
+        )
+        rs = cv.resize(
+            right_strip,
+            dsize=None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv.INTER_AREA,
+        )
+    else:
+        ls, rs = left_strip, right_strip
+    dx_s, dy_s, resp = _phase_shift(ls, rs, blur_sigma=blur_sigma)
+    return dx_s / scale, dy_s / scale, resp
+
+
+def register_pair_translation(
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    overlap_frac: float = OVERLAP_FRAC,
+) -> tuple[float, float, dict]:
+    """Estimate (tx, ty) placing right's origin relative to left's origin.
+
+    Translation only — no rotation / scale / perspective. Uses predicted
+    overlap strips: phase correlation → ECC translation, with strip-local
+    SIFT as a bootstrap when phase response is weak.
+    """
+    best: tuple[float, float, dict] | None = None
+    # Prefer fractions near the true booklet overlap (~15–25%); wider strips
+    # dilute the peak and can lock onto non-overlap structure.
+    fracs = [overlap_frac]
+    for f in (0.20, 0.22, 0.25, 0.18, 0.30):
+        if all(abs(f - x) > 1e-6 for x in fracs):
+            fracs.append(f)
+
+    for frac in fracs:
+        left_strip, right_strip, sw, w0 = _overlap_strips(left, right, frac)
+        h, w = left_strip.shape[:2]
+        long_edge = max(h, w)
+        scale = 1.0
+        if long_edge > STRIP_COARSE_LONG_EDGE:
+            scale = STRIP_COARSE_LONG_EDGE / float(long_edge)
+
+        dx, dy, resp = _strip_shift_at_scale(
+            left_strip, right_strip, scale=scale, blur_sigma=1.5
+        )
+        method = "phase"
+
+        if resp < STRIP_PHASE_MIN_RESP:
+            feat = _strip_feature_translation(left_strip, right_strip)
+            if feat is not None:
+                dx, dy, feat_score = feat
+                resp = max(resp, feat_score)
+                method = "sift-strip"
+
+        # Full-strip ECC refine (translation warp only).
+        dx_e, dy_e, cc = _ecc_translation(left_strip, right_strip, dx, dy)
+        if cc > 0.15:
+            dx, dy = dx_e, dy_e
+            method = method + "+ecc"
+
+        # Nominal co-location of strips: right origin at (w0 - sw, 0).
+        # phaseCorrelate(left, right) / ECC warp encode the shift that
+        # warpAffine would apply to *sample* the right strip (dst=src(x+d)),
+        # which moves content by -d. Panel corner placement must therefore
+        # use the opposite sign so content moves into alignment.
+        tx = float(w0 - sw) - float(dx)
+        ty = -float(dy)
+        info = {
+            "overlap_frac": float(frac),
+            "strip_w": int(sw),
+            "phase_resp": float(resp),
+            "ecc_cc": float(cc),
+            "method": method,
+            "dx_strip": float(dx),
+            "dy_strip": float(dy),
+        }
+        # Score by phase response only — ECC cc stays high even on bad fracs.
+        score = float(resp)
+        if best is None or score > best[2].get("_score", -1.0):
+            info["_score"] = score
+            best = (tx, ty, info)
+
+    if best is None:
+        raise StitchError("Overlap-strip registration failed")
+    tx, ty, info = best
+    info.pop("_score", None)
+    if info.get("phase_resp", 0.0) < STRIP_PHASE_MIN_RESP and info.get(
+        "ecc_cc", 0.0
+    ) < 0.15:
+        raise StitchError(
+            "Could not lock overlap strip (weak phase/ECC). "
+            "Need a clearer horizontal overlap with distinctive features "
+            f"[engine {ENGINE_REVISION}]"
+        )
+    return tx, ty, info
+
+
+def _robust_band_shift(
+    gray_cans: list[np.ndarray],
+    mask_cans: list[np.ndarray],
+    seam_x: int,
+    *,
+    min_resp: float = 0.10,
+    lf_sigma: float = 2.5,
+) -> tuple[float, float, int] | None:
+    """Median (dx, dy) near the seam with LF blur + outlier rejection."""
+    if seam_x < 0:
+        return None
+    g0 = cv.GaussianBlur(gray_cans[0], (0, 0), lf_sigma)
+    g1 = cv.GaussianBlur(gray_cans[1], (0, 0), lf_sigma)
+    samples = _overlap_band_shifts(
+        [g0, g1], mask_cans, seam_x, min_resp=min_resp
+    )
+    if len(samples) < 4:
+        return None
+    dxs = np.asarray([s[1] for s in samples], dtype=np.float64)
+    dys = np.asarray([s[2] for s in samples], dtype=np.float64)
+    med_x = float(np.median(dxs))
+    med_y = float(np.median(dys))
+    mad_x = float(np.median(np.abs(dxs - med_x))) + 1e-6
+    mad_y = float(np.median(np.abs(dys - med_y))) + 1e-6
+    keep = (np.abs(dxs - med_x) < 4.0 * 1.4826 * mad_x) & (
+        np.abs(dys - med_y) < 4.0 * 1.4826 * mad_y
+    )
+    if int(keep.sum()) < 3:
+        return med_x, med_y, len(samples)
+    return (
+        float(np.median(dxs[keep])),
+        float(np.median(dys[keep])),
+        int(keep.sum()),
+    )
+
+
+def refine_pair_translation(
+    images: list[np.ndarray],
+    masks: list[np.ndarray],
+    corners: list[tuple[float, float]],
+    *,
+    max_passes: int = REFINE_MAX_PASSES,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[tuple[float, float]]]:
+    """Nudge the right panel by a robust (dx, dy) from mid-overlap phaseCorr.
+
+    Translation only — no rotation. Operates on already-placed panels.
+    Corners may be fractional (sub-pixel placement via warp in compose).
+    """
+    if len(images) != 2:
+        return images, masks, corners
+
+    corners_f: list[tuple[float, float]] = [
+        (float(c[0]), float(c[1])) for c in corners
+    ]
+    order = sorted(range(2), key=lambda i: corners_f[i][0])
+    right_i = order[1]
+
+    for _ in range(max_passes):
+        # Integer paste for measurement; sub-pixel kept in corners_f.
+        corners_i = [(int(round(c[0])), int(round(c[1]))) for c in corners_f]
+        cans, mcans, _x0, _y0, _W, _H = _pair_to_canvas(
+            images, masks, corners_i
+        )
+        _ox0, _ox1, mid = _overlap_mid_x(mcans)
+        if mid < 0:
+            break
+        gray_cans = [
+            cv.cvtColor(c, cv.COLOR_BGR2GRAY).astype(np.float32) for c in cans
+        ]
+        mask_bins = [(m > 0).astype(np.uint8) for m in mcans]
+        got = _robust_band_shift(gray_cans, mask_bins, mid)
+        if got is None:
+            break
+        dtx, dty, n = got
+        if n < 4:
+            break
+        if abs(dtx) < REFINE_MIN_ABS_PX and abs(dty) < REFINE_MIN_ABS_PX:
+            break
+        if abs(dtx) > REFINE_MAX_ABS_PX or abs(dty) > REFINE_MAX_ABS_PX:
+            break
+        # phaseCorrelate(left, right) shift uses warpAffine sampling sense;
+        # move the right panel corner by the opposite translation.
+        cx, cy = corners_f[right_i]
+        corners_f[right_i] = (cx - dtx, cy - dty)
+    return images, masks, corners_f
+
+
+def balance_overlap_gain(
+    images: list[np.ndarray],
+    masks: list[np.ndarray],
+    corners: list[tuple[int, int]],
+) -> list[np.ndarray]:
+    """Match right-panel mean RGB to left in the overlap (light color balance)."""
+    if len(images) != 2:
+        return images
+    cans, mcans, _x0, _y0, _W, _H = _pair_to_canvas(images, masks, corners)
+    ov = (mcans[0] > 0) & (mcans[1] > 0)
+    if not np.any(ov) or int(ov.sum()) < 1024:
+        return images
+    order = sorted(range(2), key=lambda i: corners[i][0])
+    left_i, right_i = order[0], order[1]
+    if corners[0] == corners[1]:
+        left_i, right_i = 0, 1
+    gains = []
+    for c in range(3):
+        m0 = float(cans[left_i][:, :, c][ov].mean())
+        m1 = float(cans[right_i][:, :, c][ov].mean())
+        if m1 < 1.0:
+            gains.append(1.0)
+        else:
+            gains.append(float(np.clip(m0 / m1, 0.85, 1.15)))
+    out = [im.copy() for im in images]
+    right = out[right_i].astype(np.float32)
+    for c, g in enumerate(gains):
+        right[:, :, c] *= g
+    out[right_i] = np.clip(right, 0, 255).astype(np.uint8)
+    return out
+
+
+def stitch_two_planar(
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    blend_type: str = BLEND_TYPE,
+    blend_strength: int = BLEND_STRENGTH,
+    overlap_frac: float = OVERLAP_FRAC,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Stitch one adjacent pair with the overlap-strip planar engine."""
+    tx, ty, reg = register_pair_translation(
+        left, right, overlap_frac=overlap_frac
+    )
+    images: list[np.ndarray] = [left, right.copy()]
+    masks = [
+        255 * np.ones((left.shape[0], left.shape[1]), dtype=np.uint8),
+        255 * np.ones((right.shape[0], right.shape[1]), dtype=np.uint8),
+    ]
+    corners_f: list[tuple[float, float]] = [(0.0, 0.0), (float(tx), float(ty))]
+
+    images, masks, corners_f = refine_pair_translation(
+        images, masks, corners_f
+    )
+    # Bake sub-pixel translation into the right panel; integer canvas corners.
+    # warpAffine dst=src(x+t) moves content by -t, so use t = -frac to shift
+    # content by +frac before placing at floor(corner).
+    cx, cy = corners_f[1]
+    cix, ciy = int(np.floor(cx)), int(np.floor(cy))
+    fx, fy = float(cx - cix), float(cy - ciy)
+    if abs(fx) > 1e-3 or abs(fy) > 1e-3:
+        M = np.array([[1.0, 0.0, -fx], [0.0, 1.0, -fy]], dtype=np.float32)
+        h1, w1 = images[1].shape[:2]
+        images[1] = cv.warpAffine(
+            images[1],
+            M,
+            (w1, h1),
+            flags=cv.INTER_CUBIC,
+            borderMode=cv.BORDER_REFLECT,
+        )
+        masks[1] = cv.warpAffine(
+            masks[1],
+            M,
+            (w1, h1),
+            flags=cv.INTER_NEAREST,
+            borderMode=cv.BORDER_CONSTANT,
+        )
+    corners: list[tuple[int, int]] = [(0, 0), (cix, ciy)]
+
+    # Non-rigid residual along the seam (1D remap — not panel rotation).
+    images, masks, corners = piecewise_align_pair(images, masks, corners)
+    images = balance_overlap_gain(images, masks, corners)
+
+    if blend_type == "freq":
+        sizes = [(im.shape[1], im.shape[0]) for im in images]
+        dst_sz = cv.detail.resultRoi(corners=corners, sizes=sizes)
+        feather_px = max(
+            16.0, float(np.sqrt(dst_sz[2] * dst_sz[3]) * blend_strength / 100.0)
+        )
+        result_u8, mask_u8 = compose_frequency_split(
+            images, masks, corners, lf_sigma=LF_SIGMA, feather_px=feather_px
+        )
+    elif blend_type == "seam":
+        result_u8, mask_u8 = compose_seam_feather(
+            images, masks, corners, feather_px=float(SEAM_FEATHER_PX)
+        )
+    elif blend_type == "no":
+        masks_h = straight_vertical_seam_masks(masks, corners)
+        result_u8, mask_u8 = compose_hard_paste(images, masks_h, corners)
+    else:
+        # Feather / multiband via OpenCV blender on translation-placed panels.
+        sizes = [(im.shape[1], im.shape[0]) for im in images]
+        dst_sz = cv.detail.resultRoi(corners=corners, sizes=sizes)
+        blend_width = np.sqrt(dst_sz[2] * dst_sz[3]) * blend_strength / 100.0
+        if blend_type == "multiband":
+            blender = cv.detail_MultiBandBlender()
+            bands = int(np.log(max(blend_width, 1.0)) / np.log(2.0) - 1.0)
+            blender.setNumBands(max(1, bands))
+        else:
+            blender = cv.detail_FeatherBlender()
+            blender.setSharpness(1.0 / max(blend_width, 1.0))
+        blender.prepare(dst_sz)
+        for img, mask, corner in zip(images, masks, corners):
+            blender.feed(cv.UMat(img.astype(np.int16)), mask, corner)
+        result, result_mask = blender.blend(None, None)
+        result_u8 = cv.convertScaleAbs(result)
+        mask_u8 = result_mask
+        if mask_u8 is not None and len(mask_u8.shape) == 3:
+            mask_u8 = mask_u8[:, :, 0]
+
+    result_u8, mask_u8 = trim_opaque(result_u8, mask_u8)
+    meta = {
+        "registration": reg,
+        "tx": float(cx),
+        "ty": float(cy),
+        "engine_revision": ENGINE_REVISION,
+        "pipeline": "overlap-strip",
+    }
+    return result_u8, mask_u8, meta
+
+
 def stitch_planar(
     paths: list[Path],
     *,
@@ -951,8 +1408,76 @@ def stitch_planar(
     match_conf: float = MATCH_CONF,
     blend_strength: int = BLEND_STRENGTH,
     blend_type: str = BLEND_TYPE,
+    legacy_opencv_stitcher: bool = False,
+    overlap_frac: float = OVERLAP_FRAC,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Return (bgr_uint8, mask_uint8, meta_from_first)."""
+    """Return (bgr_uint8, mask_uint8, meta_from_first).
+
+    Default: constrained overlap-strip planar chain (translation only).
+    Pass ``legacy_opencv_stitcher=True`` for the old ``cv.detail`` path.
+    """
+    if legacy_opencv_stitcher:
+        return stitch_planar_legacy_opencv(
+            paths,
+            work_megapix=work_megapix,
+            seam_megapix=seam_megapix,
+            compose_megapix=compose_megapix,
+            conf_thresh=conf_thresh,
+            match_conf=match_conf,
+            blend_strength=blend_strength,
+            blend_type=blend_type,
+        )
+
+    if len(paths) < 2:
+        raise StitchError("Need at least two images to stitch")
+
+    full_imgs: list[np.ndarray] = []
+    metas: list[dict] = []
+    for path in paths:
+        bgr, meta = load_bgr(path)
+        if bgr is None or bgr.size == 0:
+            raise StitchError(f"Cannot read image: {path}")
+        full_imgs.append(bgr)
+        metas.append(meta)
+
+    # Successive pairwise onto an accumulating canvas (left → right).
+    acc = full_imgs[0]
+    acc_mask = 255 * np.ones((acc.shape[0], acc.shape[1]), dtype=np.uint8)
+    regs: list[dict] = []
+    for i in range(1, len(full_imgs)):
+        acc, acc_mask, pair_meta = stitch_two_planar(
+            acc,
+            full_imgs[i],
+            blend_type=blend_type,
+            blend_strength=blend_strength,
+            overlap_frac=overlap_frac,
+        )
+        regs.append(pair_meta.get("registration") or {})
+
+    meta = dict(metas[0])
+    meta["paths_used"] = [str(p) for p in paths]
+    meta["dropped"] = []
+    meta["count"] = len(full_imgs)
+    meta["engine_revision"] = ENGINE_REVISION
+    meta["pipeline"] = "overlap-strip"
+    meta["registrations"] = regs
+    meta["match_conf_used"] = None
+    meta["conf_thresh_used"] = None
+    return acc, acc_mask, meta
+
+
+def stitch_planar_legacy_opencv(
+    paths: list[Path],
+    *,
+    work_megapix: float = WORK_MEGAPIX,
+    seam_megapix: float = SEAM_MEGAPIX,
+    compose_megapix: float = COMPOSE_MEGAPIX,
+    conf_thresh: float = CONF_THRESH,
+    match_conf: float = MATCH_CONF,
+    blend_strength: int = BLEND_STRENGTH,
+    blend_type: str = BLEND_TYPE,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Legacy ``cv.detail`` affine stitcher (kept for A/B)."""
     if len(paths) < 2:
         raise StitchError("Need at least two images to stitch")
 
@@ -1301,6 +1826,7 @@ def stitch_planar(
     meta["dropped"] = dropped_note
     meta["count"] = num_images
     meta["engine_revision"] = ENGINE_REVISION
+    meta["pipeline"] = "legacy-opencv-stitcher"
     meta["match_conf_used"] = float(used_match[0])
     meta["conf_thresh_used"] = float(used_match[1])
     return result_u8, mask_u8, meta
@@ -1308,7 +1834,10 @@ def stitch_planar(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Planar (affine) stitch overlapping flatbed TIFF scans."
+        description=(
+            "Planar stitch overlapping flatbed TIFF scans "
+            "(overlap-strip translation; no rotation/perspective)."
+        )
     )
     parser.add_argument(
         "images",
@@ -1354,6 +1883,20 @@ def main(argv: list[str] | None = None) -> int:
         default=BLEND_STRENGTH,
         help=f"Blend width factor 0-100 (default {BLEND_STRENGTH})",
     )
+    parser.add_argument(
+        "--overlap-frac",
+        type=float,
+        default=OVERLAP_FRAC,
+        help=(
+            f"Predicted horizontal overlap fraction of panel width "
+            f"(default {OVERLAP_FRAC})"
+        ),
+    )
+    parser.add_argument(
+        "--legacy-opencv-stitcher",
+        action="store_true",
+        help="Use the old cv.detail affine stitcher (A/B only)",
+    )
     args = parser.parse_args(argv)
     as_json = args.json
 
@@ -1381,6 +1924,8 @@ def main(argv: list[str] | None = None) -> int:
             work_megapix=args.work_megapix,
             blend_strength=args.blend_strength,
             blend_type=args.blend,
+            legacy_opencv_stitcher=bool(args.legacy_opencv_stitcher),
+            overlap_frac=float(args.overlap_frac),
         )
         dpi = meta.get("dpi") or (600.0, 600.0)
         if isinstance(dpi, (int, float)):
@@ -1415,7 +1960,8 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     h, w = bgr.shape[:2]
-    msg = f"Stitched {meta['count']} panels → {w}×{h}"
+    pipeline = meta.get("pipeline") or "overlap-strip"
+    msg = f"Stitched {meta['count']} panels → {w}×{h} [{pipeline}]"
     if meta.get("dropped"):
         msg += f" (dropped unmatched: {', '.join(meta['dropped'])})"
 
@@ -1431,6 +1977,7 @@ def main(argv: list[str] | None = None) -> int:
             "count": meta["count"],
             "tiff": all(_is_tiff(p) for p in paths),
             "engineRevision": ENGINE_REVISION,
+            "pipeline": pipeline,
             "matchConf": meta.get("match_conf_used"),
             "confThresh": meta.get("conf_thresh_used"),
         },
