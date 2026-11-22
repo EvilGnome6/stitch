@@ -29,19 +29,44 @@ COMPOSE_MEGAPIX = -1.0  # full resolution
 CONF_THRESH = 0.5
 MATCH_CONF = 0.5
 # If the first pass finds no connected overlap, retry these (more permissive).
+# Soft/halftone booklet overlaps often land ~0.7 pairwise conf — below the
+# old OpenCV-style thresh of 1.0 — so keep a short ladder down to 0.3.
 MATCH_FALLBACKS = (
     (0.4, 0.45),
+    (0.3, 0.3),
 )
+# Bumped when match/seam defaults change so a stale app Resources engine is obvious.
+ENGINE_REVISION = "2026-11-22-seam-match"
 # Frequency-split: wide LF feather hides seams/tone jumps; hard HF keeps screen.
 BLEND_STRENGTH = 5
-BLEND_TYPE = "no"  # no | freq | feather | multiband — "no"=hard paste after block gain
+# "seam"=narrow mid-overlap feather (ICE-like); "no"=hard paste; also freq/feather/multiband.
+BLEND_TYPE = "seam"
+SEAM_FEATHER_PX = 28  # ICE planar joins are soft (~seam sharpness), not hard cuts
 LF_SIGMA = 12.0  # illumination only; larger values smear mid-freq into a soft stripe
 EXPOS_BLOCK = 64  # large-ish blocks for smooth scanner drift
-# Work-megapix BA often leaves a few full-res px of vertical error (sparse
-# matches + halftone ambiguity). Probe-compose and nudge cam1.ty to fix.
+# Work-megapix BA leaves residual tx/ty/rotation on soft/halftone overlaps.
+# Probe the warped overlap near the future seam and nudge cam1.R to fix.
 REFINE_PROBE_SCALE = 0.5
-REFINE_MAX_PASSES = 2
-REFINE_MIN_ABS_PX = 0.4  # full-res px; ignore tiny residuals
+REFINE_MAX_PASSES = 3
+REFINE_MIN_ABS_PX = 0.35  # full-res px; ignore tiny residuals
+REFINE_MAX_ABS_PX = 40.0  # guard against runaway corrections
+REFINE_MIN_ROT_DEG = 0.004
+REFINE_MAX_ROT_DEG = 0.15
+REFINE_SEAM_BAND = 70  # probe-px half-width around mid-overlap seam
+REFINE_MIN_RESP = 0.15  # phaseCorrelate response floor per band
+# After global affine, residual dy(y) along the seam is still ±1–3px on
+# soft/halftone booklets. A 1D remap of the right panel, locked to the
+# ~6px screen via DoG/high-pass phase correlation, removes most of it.
+PIECEWISE_MAX_PASSES = 3
+PIECEWISE_STRIP = 90
+PIECEWISE_STEP = 30
+PIECEWISE_HALF = 70
+PIECEWISE_MIN_RESP = 0.08
+PIECEWISE_CONVERGE_PX = 0.10
+# Prefer LF blur over DoG/high-pass: the ~6px halftone screen creates
+# false phaseCorrelate peaks that can "converge" on the wrong period.
+PIECEWISE_LF_SIGMA = 2.5
+PIECEWISE_SMOOTH_SIGMA = 30.0
 
 
 class StitchError(Exception):
@@ -260,6 +285,191 @@ def measure_vertical_seam_offset(
     return best
 
 
+def _warp_pair_to_canvas(
+    cams: list,
+    images: list[np.ndarray],
+    *,
+    work_scale: float,
+    probe_scale: float,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[tuple[int, int]], int, int, int]:
+    """Warp both panels into a shared probe canvas. Returns gray cans, masks, corners, seam_x, H, W."""
+    aspect = probe_scale / work_scale
+    probe_imgs = [
+        cv.resize(
+            img,
+            dsize=None,
+            fx=probe_scale,
+            fy=probe_scale,
+            interpolation=cv.INTER_AREA,
+        )
+        for img in images
+    ]
+    focals = [float(c.focal) for c in cams]
+    warped_scale = float(np.median(focals)) * aspect
+    probe_cams = _clone_cameras(cams)
+    for c in probe_cams:
+        c.focal *= aspect
+        c.ppx *= aspect
+        c.ppy *= aspect
+    warper = cv.PyRotationWarper("affine", warped_scale)
+    corners: list[tuple[int, int]] = []
+    warped: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    for i, img in enumerate(probe_imgs):
+        K = probe_cams[i].K().astype(np.float32)
+        corner, image_wp = warper.warp(
+            img, K, probe_cams[i].R, cv.INTER_LINEAR, cv.BORDER_REFLECT
+        )
+        mask = 255 * np.ones(img.shape[:2], np.uint8)
+        _, mask_wp = warper.warp(
+            mask, K, probe_cams[i].R, cv.INTER_NEAREST, cv.BORDER_CONSTANT
+        )
+        corners.append(corner)
+        warped.append(image_wp)
+        masks.append(mask_wp)
+    sizes = [(im.shape[1], im.shape[0]) for im in warped]
+    x0, y0, W, H = cv.detail.resultRoi(corners=corners, sizes=sizes)
+    gray_cans: list[np.ndarray] = []
+    mask_cans: list[np.ndarray] = []
+    for img, mask, corner in zip(warped, masks, corners):
+        g = cv.cvtColor(img, cv.COLOR_BGR2GRAY).astype(np.float32)
+        m = (np.asarray(mask) > 0).astype(np.uint8)
+        cx, cy = int(corner[0]), int(corner[1])
+        mh, mw = m.shape[:2]
+        cg = np.zeros((H, W), dtype=np.float32)
+        cm = np.zeros((H, W), dtype=np.uint8)
+        ix0, iy0 = cx - x0, cy - y0
+        sx0, sy0 = max(0, -ix0), max(0, -iy0)
+        dx0, dy0 = max(0, ix0), max(0, iy0)
+        sx1, sy1 = min(mw, W - ix0), min(mh, H - iy0)
+        if sx1 > sx0 and sy1 > sy0:
+            cg[dy0 : dy0 + (sy1 - sy0), dx0 : dx0 + (sx1 - sx0)] = g[
+                sy0:sy1, sx0:sx1
+            ]
+            cm[dy0 : dy0 + (sy1 - sy0), dx0 : dx0 + (sx1 - sx0)] = m[
+                sy0:sy1, sx0:sx1
+            ]
+        gray_cans.append(cg)
+        mask_cans.append(cm)
+    overlap = (mask_cans[0] > 0) & (mask_cans[1] > 0)
+    if not np.any(overlap):
+        return gray_cans, mask_cans, corners, -1, H, W
+    xs = np.where(overlap.any(axis=0))[0]
+    seam_x = int((int(xs.min()) + int(xs.max())) // 2)
+    return gray_cans, mask_cans, corners, seam_x, H, W
+
+
+def _overlap_band_shifts(
+    gray_cans: list[np.ndarray],
+    mask_cans: list[np.ndarray],
+    seam_x: int,
+    *,
+    band: int = REFINE_SEAM_BAND,
+    min_resp: float = REFINE_MIN_RESP,
+) -> list[tuple[float, float, float, float]]:
+    """Same-pixel phaseCorrelate samples near the mid-overlap seam.
+
+    Returns list of (y_probe, dx_probe, dy_probe, response). dx/dy are the
+    shift to apply to cam1 to match cam0 (OpenCV phaseCorrelate convention).
+    """
+    if seam_x < 0:
+        return []
+    overlap = (mask_cans[0] > 0) & (mask_cans[1] > 0)
+    H, W = gray_cans[0].shape
+    x0 = max(0, seam_x - band)
+    x1 = min(W, seam_x + band)
+    if x1 - x0 < 24:
+        return []
+    samples: list[tuple[float, float, float, float]] = []
+    for frac in np.linspace(0.08, 0.92, 15):
+        yc = int(H * frac)
+        y0 = yc - 35
+        y1 = yc + 35
+        if y0 < 0 or y1 > H:
+            continue
+        mm = overlap[y0:y1, x0:x1]
+        if float(mm.mean()) < 0.8:
+            continue
+        a = gray_cans[0][y0:y1, x0:x1].copy()
+        b = gray_cans[1][y0:y1, x0:x1].copy()
+        a[~mm] = 0
+        b[~mm] = 0
+        win = np.hanning(a.shape[0])[:, None] * np.hanning(a.shape[1])[None, :]
+        shift, resp = cv.phaseCorrelate(a * win, b * win)
+        if resp < min_resp:
+            continue
+        samples.append((float(yc), float(shift[0]), float(shift[1]), float(resp)))
+    return samples
+
+
+def refine_overlap_affine(
+    cameras: list,
+    images: list[np.ndarray],
+    *,
+    work_scale: float,
+    probe_scale: float = REFINE_PROBE_SCALE,
+    max_passes: int = REFINE_MAX_PASSES,
+) -> list:
+    """Nudge camera[1] tx/ty/rotation so overlap content aligns at the seam.
+
+    OpenCV's work-megapix affine BA is under-constrained on soft/halftone
+    booklet overlaps. A page-edge-only ty nudge can zero the bottom light→dark
+    step while leaving several full-res pixels of horizontal error and a small
+    residual rotation — both of which break the angled halftone screen at the
+    hard seam. Measuring same-pixel phase correlation in a narrow band around
+    the mid-overlap cut (the cut compose will use) and refining tx, ty, and a
+    tiny rotation matches ICE much more closely.
+    """
+    if len(cameras) != 2 or len(images) != 2:
+        return cameras
+    if work_scale <= 0 or probe_scale <= 0:
+        return cameras
+
+    cams = _clone_cameras(cameras)
+    s_ratio = work_scale / probe_scale  # probe-px → work-px for R translations
+    for _ in range(max_passes):
+        gray_cans, mask_cans, _corners, seam_x, _H, _W = _warp_pair_to_canvas(
+            cams, images, work_scale=work_scale, probe_scale=probe_scale
+        )
+        samples = _overlap_band_shifts(gray_cans, mask_cans, seam_x)
+        if len(samples) < 4:
+            break
+        ys = np.array([s[0] for s in samples], dtype=np.float64)
+        dxs = np.array([s[1] for s in samples], dtype=np.float64)
+        dys = np.array([s[2] for s in samples], dtype=np.float64)
+        # dx(y) ≈ dx0 + θ·y  → θ is residual rotation of cam1 vs cam0 (probe px).
+        theta, _dx0 = np.polyfit(ys, dxs, 1)
+        dtx_probe = float(np.mean(dxs))
+        dty_probe = float(np.mean(dys))
+        dtx_full = dtx_probe / probe_scale
+        dty_full = dty_probe / probe_scale
+        theta_deg = float(np.degrees(theta))
+
+        trans_done = (
+            abs(dtx_full) < REFINE_MIN_ABS_PX and abs(dty_full) < REFINE_MIN_ABS_PX
+        )
+        rot_done = abs(theta_deg) < REFINE_MIN_ROT_DEG
+        if trans_done and rot_done:
+            break
+        if abs(dtx_full) > REFINE_MAX_ABS_PX or abs(dty_full) > REFINE_MAX_ABS_PX:
+            break
+        if abs(theta_deg) > REFINE_MAX_ROT_DEG:
+            # Ambiguous content — skip rotation this pass, still allow translation.
+            theta = 0.0
+
+        R = np.asarray(cams[1].R, dtype=np.float64).reshape(3, 3).copy()
+        if abs(theta) > 1e-12:
+            c, s = float(np.cos(theta)), float(np.sin(theta))
+            # Left-multiply in the same [[c,s],[-s,c]] convention BA uses.
+            R = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]]) @ R
+        # phaseCorrelate shift applied to cam1; same work-scale units as BA.
+        if not trans_done:
+            R[0, 2] += dtx_probe * s_ratio
+            R[1, 2] += dty_probe * s_ratio
+        cams[1].R = R.astype(np.float32)
+    return cams
+
+
 def refine_vertical_translation(
     cameras: list,
     images: list[np.ndarray],
@@ -268,102 +478,259 @@ def refine_vertical_translation(
     probe_scale: float = REFINE_PROBE_SCALE,
     max_passes: int = REFINE_MAX_PASSES,
 ) -> list:
-    """Nudge camera[1] ty so a probe hard-seam compose has no vertical step.
+    """Backward-compatible alias for :func:`refine_overlap_affine`."""
+    return refine_overlap_affine(
+        cameras,
+        images,
+        work_scale=work_scale,
+        probe_scale=probe_scale,
+        max_passes=max_passes,
+    )
 
-    OpenCV's work-megapix affine BA is under-constrained on soft/halftone
-    overlaps and often leaves a few full-res pixels of vertical error that
-    show up as a step at the booklet seam (especially at the bottom).
+
+def _pair_to_canvas(
+    images: list[np.ndarray],
+    masks: list[np.ndarray],
+    corners: list[tuple[int, int]],
+) -> tuple[list[np.ndarray], list[np.ndarray], int, int, int, int]:
+    """Paste warped panels into a shared canvas. Returns cans, mcans, x0, y0, W, H."""
+    sizes = [(im.shape[1], im.shape[0]) for im in images]
+    x0, y0, W, H = cv.detail.resultRoi(corners=corners, sizes=sizes)
+    cans: list[np.ndarray] = []
+    mcans: list[np.ndarray] = []
+    for img, mask, corner in zip(images, masks, corners):
+        img = np.asarray(img.get() if hasattr(img, "get") else img)
+        mask = np.asarray(mask.get() if hasattr(mask, "get") else mask)
+        cx, cy = int(corner[0]), int(corner[1])
+        h, w = img.shape[:2]
+        c = np.zeros((H, W, 3), dtype=np.uint8)
+        m = np.zeros((H, W), dtype=np.uint8)
+        ix0, iy0 = cx - x0, cy - y0
+        sx0, sy0 = max(0, -ix0), max(0, -iy0)
+        dx0, dy0 = max(0, ix0), max(0, iy0)
+        sx1, sy1 = min(w, W - ix0), min(h, H - iy0)
+        if sx1 > sx0 and sy1 > sy0:
+            c[dy0 : dy0 + (sy1 - sy0), dx0 : dx0 + (sx1 - sx0)] = img[
+                sy0:sy1, sx0:sx1
+            ]
+            m[dy0 : dy0 + (sy1 - sy0), dx0 : dx0 + (sx1 - sx0)] = (
+                (mask[sy0:sy1, sx0:sx1] > 0).astype(np.uint8) * 255
+            )
+        cans.append(c)
+        mcans.append(m)
+    return cans, mcans, x0, y0, W, H
+
+
+def _overlap_mid_x(mcans: list[np.ndarray]) -> tuple[int, int, int]:
+    ov = (mcans[0] > 0) & (mcans[1] > 0)
+    if not np.any(ov):
+        return -1, -1, -1
+    xs = np.where(ov.any(axis=0))[0]
+    ox0, ox1 = int(xs.min()), int(xs.max())
+    return ox0, ox1, int((ox0 + ox1) // 2)
+
+
+def _piecewise_shift_profile(
+    gray0: np.ndarray,
+    gray1: np.ndarray,
+    overlap: np.ndarray,
+    seam_x: int,
+    *,
+    strip: int = PIECEWISE_STRIP,
+    step: int = PIECEWISE_STEP,
+    half: int = PIECEWISE_HALF,
+    min_resp: float = PIECEWISE_MIN_RESP,
+    lf_sigma: float = PIECEWISE_LF_SIGMA,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Robust (y, dx, dy) samples via LF phaseCorrelate along the seam."""
+    H = gray0.shape[0]
+    h0 = cv.GaussianBlur(gray0.astype(np.float32), (0, 0), lf_sigma)
+    h1 = cv.GaussianBlur(gray1.astype(np.float32), (0, 0), lf_sigma)
+    ys: list[float] = []
+    dxs: list[float] = []
+    dys: list[float] = []
+    for yc in range(strip, H - strip, step):
+        y0, y1 = yc - strip // 2, yc + strip // 2
+        x0, x1 = seam_x - half, seam_x + half
+        if x0 < 0 or x1 > gray0.shape[1]:
+            continue
+        mm = overlap[y0:y1, x0:x1]
+        if float(mm.mean()) < 0.9:
+            continue
+        a = h0[y0:y1, x0:x1].copy()
+        b = h1[y0:y1, x0:x1].copy()
+        a[~mm] = 0
+        b[~mm] = 0
+        win = np.hanning(a.shape[0])[:, None] * np.hanning(a.shape[1])[None, :]
+        shift, resp = cv.phaseCorrelate(a * win, b * win)
+        if resp < min_resp:
+            continue
+        ys.append(float(yc))
+        dxs.append(float(shift[0]))
+        dys.append(float(shift[1]))
+    if len(ys) < 8:
+        return (
+            np.asarray(ys, dtype=np.float64),
+            np.asarray(dxs, dtype=np.float64),
+            np.asarray(dys, dtype=np.float64),
+        )
+    ys_a = np.asarray(ys, dtype=np.float64)
+    dxs_a = np.asarray(dxs, dtype=np.float64)
+    dys_a = np.asarray(dys, dtype=np.float64)
+    med_y = float(np.median(dys_a))
+    mad_y = float(np.median(np.abs(dys_a - med_y))) + 1e-6
+    med_x = float(np.median(dxs_a))
+    keep = (np.abs(dys_a - med_y) < 4.0 * 1.4826 * mad_y) & (
+        np.abs(dxs_a - med_x) < 5.0
+    )
+    return ys_a[keep], dxs_a[keep], dys_a[keep]
+
+
+def piecewise_align_pair(
+    images: list[np.ndarray],
+    masks: list[np.ndarray],
+    corners: list[tuple[int, int]],
+    *,
+    max_passes: int = PIECEWISE_MAX_PASSES,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[tuple[int, int]]]:
+    """Remap the right panel so overlap content tracks the left along the seam.
+
+    Global affine (BA + content refine) still leaves a slowly varying ±1–3px
+    residual on soft/halftone booklet scans. Measuring that residual with
+    low-pass phase correlation (avoids ~6px screen-period aliases) and
+    applying a smooth 1D remap of the right panel matches ICE much more
+    closely. Returns full-canvas images/masks with shared origin corners.
     """
-    if len(cameras) != 2 or len(images) != 2:
-        return cameras
-    if work_scale <= 0 or probe_scale <= 0:
-        return cameras
+    if len(images) != 2:
+        return images, masks, corners
 
-    cams = _clone_cameras(cameras)
+    cans, mcans, x0, y0, W, H = _pair_to_canvas(images, masks, corners)
+    ox0, ox1, mid = _overlap_mid_x(mcans)
+    if mid < 0:
+        return images, masks, corners
+
+    order = sorted(range(2), key=lambda i: corners[i][0])
+    left_i, right_i = order[0], order[1]
+    g_left = cv.cvtColor(cans[left_i], cv.COLOR_BGR2GRAY)
+    right = cans[right_i]
+    right_m = mcans[right_i]
+
+    fade = ((mcans[0] > 0) & (mcans[1] > 0)).astype(np.float32)
+    fade = cv.GaussianBlur(fade, (0, 0), 12)
+    band = np.zeros(W, dtype=np.float32)
+    half_band = max(180, (ox1 - ox0) // 2)
+    band[max(0, mid - half_band) : min(W, mid + half_band)] = 1.0
+    band = cv.GaussianBlur(band.reshape(1, -1), (0, 0), 50).ravel()
+    fade = fade * band.reshape(1, -1)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+
     for _ in range(max_passes):
-        probe_imgs = [
-            cv.resize(
-                img,
-                dsize=None,
-                fx=probe_scale,
-                fy=probe_scale,
-                interpolation=cv.INTER_AREA,
-            )
-            for img in images
-        ]
-        aspect = probe_scale / work_scale
-        focals = [float(c.focal) for c in cams]
-        warped_scale = float(np.median(focals)) * aspect
-        probe_cams = _clone_cameras(cams)
-        for c in probe_cams:
-            c.focal *= aspect
-            c.ppx *= aspect
-            c.ppy *= aspect
-        warper = cv.PyRotationWarper("affine", warped_scale)
-        corners: list[tuple[int, int]] = []
-        warped: list[np.ndarray] = []
-        masks: list[np.ndarray] = []
-        for i, img in enumerate(probe_imgs):
-            K = probe_cams[i].K().astype(np.float32)
-            corner, image_wp = warper.warp(
-                img, K, probe_cams[i].R, cv.INTER_LINEAR, cv.BORDER_REFLECT
-            )
-            mask = 255 * np.ones(img.shape[:2], np.uint8)
-            _, mask_wp = warper.warp(
-                mask, K, probe_cams[i].R, cv.INTER_NEAREST, cv.BORDER_CONSTANT
-            )
-            corners.append(corner)
-            warped.append(image_wp)
-            masks.append(mask_wp)
-        # Same mid-overlap cut that compose will use — measure there, not at
-        # whatever column happens to have the strongest tone gradient.
-        sizes = [(im.shape[1], im.shape[0]) for im in warped]
-        x0, y0, W, H = cv.detail.resultRoi(corners=corners, sizes=sizes)
-        canvases = []
-        for mask, corner in zip(masks, corners):
-            m = (np.asarray(mask) > 0).astype(np.uint8)
-            cx, cy = int(corner[0]), int(corner[1])
-            mh, mw = m.shape[:2]
-            canvas = np.zeros((H, W), dtype=np.uint8)
-            ix0, iy0 = cx - x0, cy - y0
-            sx0, sy0 = max(0, -ix0), max(0, -iy0)
-            dx0, dy0 = max(0, ix0), max(0, iy0)
-            sx1, sy1 = min(mw, W - ix0), min(mh, H - iy0)
-            if sx1 > sx0 and sy1 > sy0:
-                canvas[dy0 : dy0 + (sy1 - sy0), dx0 : dx0 + (sx1 - sx0)] = m[
-                    sy0:sy1, sx0:sx1
-                ]
-            canvases.append(canvas)
-        overlap = (canvases[0] > 0) & (canvases[1] > 0)
-        if not np.any(overlap):
+        g_right = cv.cvtColor(right, cv.COLOR_BGR2GRAY)
+        ov = (mcans[left_i] > 0) & (right_m > 0)
+        ys, dxs, dys = _piecewise_shift_profile(g_left, g_right, ov, mid)
+        if len(ys) < 8:
             break
-        xs = np.where(overlap.any(axis=0))[0]
-        seam_x_panorama = int((int(xs.min()) + int(xs.max())) // 2)
+        mean_abs = float(np.mean(np.abs(dys)) + np.mean(np.abs(dxs)))
+        if mean_abs < PIECEWISE_CONVERGE_PX * 2.0:
+            break
+        ys_ext = np.concatenate([[0.0], ys, [float(H - 1)]])
+        dy_row = np.interp(
+            np.arange(H), ys_ext, np.concatenate([[dys[0]], dys, [dys[-1]]])
+        ).astype(np.float32)
+        dx_row = np.interp(
+            np.arange(H), ys_ext, np.concatenate([[dxs[0]], dxs, [dxs[-1]]])
+        ).astype(np.float32)
+        dy_row = cv.GaussianBlur(
+            dy_row.reshape(-1, 1), (0, 0), PIECEWISE_SMOOTH_SIGMA
+        ).ravel()
+        dx_row = cv.GaussianBlur(
+            dx_row.reshape(-1, 1), (0, 0), PIECEWISE_SMOOTH_SIGMA
+        ).ravel()
+        # phaseCorrelate(src1=left, src2=right): warp right by +shift to match left.
+        map_x = xx + dx_row.reshape(-1, 1) * fade
+        map_y = yy + dy_row.reshape(-1, 1) * fade
+        right = cv.remap(
+            right, map_x, map_y, cv.INTER_CUBIC, borderMode=cv.BORDER_REFLECT
+        )
+        right_m = cv.remap(
+            right_m, map_x, map_y, cv.INTER_NEAREST, borderMode=cv.BORDER_CONSTANT
+        )
 
-        masks = straight_vertical_seam_masks(masks, corners)
-        probe, probe_mask = compose_hard_paste(warped, masks, corners)
-        # Map panorama seam into the trimmed probe coordinates.
-        probe_trim, mask_trim = trim_opaque(probe, probe_mask)
-        ys, xxs = np.where(probe_mask > 0)
-        if len(xxs) == 0:
-            break
-        trim_x0 = int(xxs.min())
-        seam_x = seam_x_panorama - trim_x0
-        offset_probe = measure_vertical_seam_offset(probe_trim, seam_x=seam_x)
-        if offset_probe is None:
-            break
-        dy_full = float(offset_probe) / probe_scale
-        if abs(dy_full) < REFINE_MIN_ABS_PX:
-            break
-        # Guard against runaway corrections on ambiguous content.
-        if abs(dy_full) > 80.0:
-            break
-        R1 = np.asarray(cams[1].R, dtype=np.float32).reshape(3, 3).copy()
-        # R translations are in work-scale pixels; positive dy_full means the
-        # right panel sits too low in the probe, so push cam1.ty up.
-        R1[1, 2] += np.float32(dy_full * work_scale)
-        cams[1].R = R1
-    return cams
+    cans[right_i] = right
+    mcans[right_i] = right_m
+    # Both panels now live on the shared canvas at the panorama origin.
+    new_corners = [(x0, y0), (x0, y0)]
+    return cans, mcans, new_corners
+
+
+def compose_seam_feather(
+    images: list[np.ndarray],
+    masks: list[np.ndarray],
+    corners: list[tuple[int, int]],
+    *,
+    feather_px: float = SEAM_FEATHER_PX,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mid-overlap vertical cut with a narrow smoothstep feather (ICE-like)."""
+    if len(images) != 2:
+        return compose_hard_paste(images, masks, corners)
+
+    cans, mcans, _x0, _y0, W, H = _pair_to_canvas(images, masks, corners)
+    ox0, ox1, mid = _overlap_mid_x(mcans)
+    if mid < 0:
+        return compose_hard_paste(images, masks, corners)
+
+    order = sorted(range(2), key=lambda i: corners[i][0])
+    left_i, right_i = order[0], order[1]
+    # If both corners are identical (post piecewise canvas), fall back to mask extent.
+    if corners[0] == corners[1]:
+        left_i, right_i = 0, 1
+        # Prefer the panel that covers more of the left half as "left".
+        mid_col = W // 2
+        if int((mcans[1][:, :mid_col] > 0).sum()) > int(
+            (mcans[0][:, :mid_col] > 0).sum()
+        ):
+            left_i, right_i = 1, 0
+
+    cov_l = mcans[left_i] > 0
+    cov_r = mcans[right_i] > 0
+    half = max(int(round(feather_px)), 1)
+    w_l = np.zeros((H, W), dtype=np.float32)
+    w_r = np.zeros((H, W), dtype=np.float32)
+    w_l[cov_l & ~cov_r] = 1.0
+    w_r[cov_r & ~cov_l] = 1.0
+    both = cov_l & cov_r
+    if np.any(both):
+        xs = np.arange(W, dtype=np.float32)
+        t = np.clip((xs - (mid - half)) / max(2 * half, 1), 0.0, 1.0)
+        t = t * t * (3.0 - 2.0 * t)
+        # Broadcast weights across rows for overlap columns.
+        w_l_col = 1.0 - t
+        w_r_col = t
+        for x in range(max(0, mid - half), min(W, mid + half + 1)):
+            col = both[:, x]
+            if not np.any(col):
+                continue
+            w_l[col, x] = float(w_l_col[x])
+            w_r[col, x] = float(w_r_col[x])
+        # Hard ownership outside the feather band.
+        left_band = both.copy()
+        left_band[:, mid - half :] = False
+        right_band = both.copy()
+        right_band[:, : mid + half + 1] = False
+        w_l[left_band] = 1.0
+        w_r[left_band] = 0.0
+        w_l[right_band] = 0.0
+        w_r[right_band] = 1.0
+
+    s = np.maximum(w_l + w_r, 1e-6)
+    w_l /= s
+    w_r /= s
+    out = (
+        cans[left_i].astype(np.float32) * w_l[..., None]
+        + cans[right_i].astype(np.float32) * w_r[..., None]
+    )
+    out_mask = ((cov_l | cov_r).astype(np.uint8)) * 255
+    return np.clip(out, 0, 255).astype(np.uint8), out_mask
 
 
 def straight_vertical_seam_masks(
@@ -665,6 +1032,7 @@ def stitch_planar(
     features = None
     pairwise = None
     idx_list: list[int] = []
+    used_match = (match_conf, conf_thresh)
     for mc, ct in attempts:
         features = [
             cv.detail.computeImageFeatures2(finder, work_img)
@@ -679,12 +1047,14 @@ def stitch_planar(
         idx_list = [int(i) for i in indices]
         if len(idx_list) >= 2:
             conf_thresh = ct
+            used_match = (mc, ct)
             break
 
     if len(idx_list) < 2:
         raise StitchError(
             "Could not find enough overlapping matches between images "
-            "(need clear overlap, like ICE planar). Check order and overlap."
+            "(need clear overlap, like ICE planar). Check order and overlap. "
+            f"[engine {ENGINE_REVISION}; tried match_conf/conf_thresh={attempts}]"
         )
 
     seam_images = [seam_images[i] for i in idx_list]
@@ -722,9 +1092,9 @@ def stitch_planar(
     if not ok:
         raise StitchError("Affine bundle adjustment failed")
 
-    # Work-res BA often leaves a few full-res px of vertical error on soft
-    # overlaps; probe-compose and nudge cam1 translation before final warp.
-    cameras = refine_vertical_translation(
+    # Work-res BA leaves residual tx/ty/rotation on soft/halftone overlaps;
+    # probe the mid-overlap band and nudge cam1 before the final warp.
+    cameras = refine_overlap_affine(
         cameras, full_imgs, work_scale=work_scale
     )
 
@@ -856,7 +1226,7 @@ def stitch_planar(
         compose_images.append(image_warped)
         compose_masks.append(mask_warped)
 
-        if blend_type not in ("freq", "no"):
+        if blend_type not in ("freq", "no", "seam"):
             image_warped_s = image_warped.astype(np.int16)
             if blender is None:
                 dst_sz = cv.detail.resultRoi(corners=corners, sizes=sizes)
@@ -873,8 +1243,14 @@ def stitch_planar(
                 blender.prepare(dst_sz)
             blender.feed(cv.UMat(image_warped_s), mask_warped, corners[idx])
 
+    # Non-rigid residual along the seam: remap right panel before cutting.
     if num_images == 2:
-        compose_masks = straight_vertical_seam_masks(compose_masks, corners)
+        compose_images, compose_masks, corners = piecewise_align_pair(
+            compose_images, compose_masks, corners
+        )
+        if blend_type != "seam":
+            # "seam" feathers across the mid-overlap; hard/freq need a cut first.
+            compose_masks = straight_vertical_seam_masks(compose_masks, corners)
 
     if blend_type == "freq":
         dst_sz = cv.detail.resultRoi(corners=corners, sizes=sizes)
@@ -887,6 +1263,13 @@ def stitch_planar(
             corners,
             lf_sigma=LF_SIGMA,
             feather_px=feather_px,
+        )
+    elif blend_type == "seam":
+        result_u8, mask_u8 = compose_seam_feather(
+            compose_images,
+            compose_masks,
+            corners,
+            feather_px=float(SEAM_FEATHER_PX),
         )
     elif blend_type == "no":
         result_u8, mask_u8 = compose_hard_paste(compose_images, compose_masks, corners)
@@ -917,6 +1300,9 @@ def stitch_planar(
     meta["paths_used"] = [str(p) for p in paths_used]
     meta["dropped"] = dropped_note
     meta["count"] = num_images
+    meta["engine_revision"] = ENGINE_REVISION
+    meta["match_conf_used"] = float(used_match[0])
+    meta["conf_thresh_used"] = float(used_match[1])
     return result_u8, mask_u8, meta
 
 
@@ -955,9 +1341,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--blend",
-        choices=("freq", "feather", "multiband", "no"),
+        choices=("seam", "freq", "feather", "multiband", "no"),
         default=BLEND_TYPE,
-        help=f"Blend mode (default {BLEND_TYPE}; freq=LF feather+HF hard seam)",
+        help=(
+            f"Blend mode (default {BLEND_TYPE}; "
+            "seam=narrow mid-overlap feather, freq=LF feather+HF hard seam)"
+        ),
     )
     parser.add_argument(
         "--blend-strength",
@@ -1004,7 +1393,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     except StitchError as exc:
         _emit(
-            {"ok": False, "status": "error", "message": str(exc)},
+            {
+                "ok": False,
+                "status": "error",
+                "message": str(exc),
+                "engineRevision": ENGINE_REVISION,
+            },
             as_json=as_json,
         )
         return 2
@@ -1014,6 +1408,7 @@ def main(argv: list[str] | None = None) -> int:
                 "ok": False,
                 "status": "error",
                 "message": f"{type(exc).__name__}: {exc}",
+                "engineRevision": ENGINE_REVISION,
             },
             as_json=as_json,
         )
@@ -1035,6 +1430,9 @@ def main(argv: list[str] | None = None) -> int:
             "height": h,
             "count": meta["count"],
             "tiff": all(_is_tiff(p) for p in paths),
+            "engineRevision": ENGINE_REVISION,
+            "matchConf": meta.get("match_conf_used"),
+            "confThresh": meta.get("conf_thresh_used"),
         },
         as_json=as_json,
     )

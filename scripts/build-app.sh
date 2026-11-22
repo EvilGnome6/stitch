@@ -4,9 +4,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/app/build/Stitch.app"
 SRC="$ROOT/app/Stitch"
 
-if [ ! -x "$SRC/Resources/engine/stitch-engine" ]; then
-  "$ROOT/scripts/sync-engine.sh"
-fi
+# Always refresh the bundled engine from engine/stitch.py — a stale copy
+# (pre-match-threshold fix) fails soft booklet overlaps with exit 2.
+"$ROOT/scripts/sync-engine.sh"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
